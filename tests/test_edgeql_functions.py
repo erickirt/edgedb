@@ -31,7 +31,7 @@ from edb.testbase import server as tb
 from edb.tools import test
 
 
-class TestEdgeQLFunctions(tb.QueryTestCase):
+class TestEdgeQLFunctions(tb.DDLTestCase):
 
     SCHEMA = os.path.join(os.path.dirname(__file__), 'schemas',
                           'issues.esdl')
@@ -9406,3 +9406,26 @@ class TestEdgeQLFunctions(tb.QueryTestCase):
             ['https://edgedb.com', '~/screenshot.png'],
             sort=True,
         )
+
+    async def test_edgeql_functions_approximate_count(self):
+        await self.assert_query_result(
+            '''
+            select sys::approximate_count(introspect Issue);
+            ''',
+            [int],
+        )
+
+        await self.assert_query_result(
+            '''
+            select sys::approximate_count(
+                introspect schema::Object, ignore_subtypes := True);
+            ''',
+            [0],
+        )
+
+        val = await self.con.query_single(
+            '''
+            select sys::approximate_count(introspect schema::Object);
+            '''
+        )
+        self.assertGreater(val, 0)
