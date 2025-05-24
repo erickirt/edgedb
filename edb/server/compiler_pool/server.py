@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import Any, Callable, cast, NamedTuple, Optional, Sequence
 
 import asyncio
-import collections
 import hmac
 import functools
 import logging
@@ -29,7 +28,6 @@ import pathlib
 import pickle
 import secrets
 import tempfile
-import time
 import traceback
 
 import click
@@ -39,12 +37,10 @@ import immutables
 from edb.common import debug
 from edb.common import lru
 from edb.common import markup
-from edb.pgsql import params as pgparams
-from edb.schema import reflection as s_refl
-from edb.schema import schema as s_schema
 from edb.server import metrics
 from edb.server import args as srvargs
 from edb.server import defines
+from edb.server import logsetup
 
 from . import amsg
 from . import pool as pool_mod
@@ -83,6 +79,16 @@ class PickledState(NamedTuple):
             database_config = self.database_config
         return PickledState(user_schema, reflection_cache, database_config)
 
+    def get_estimated_size(self) -> int:
+        rv = 0
+        if self.user_schema is not None:
+            rv += len(self.user_schema)
+        if self.reflection_cache is not None:
+            rv += len(self.reflection_cache)
+        if self.database_config is not None:
+            rv += len(self.database_config)
+        return rv
+
 
 class ClientSchema(NamedTuple):
     dbs: immutables.Map[str, PickledState]
@@ -90,7 +96,7 @@ class ClientSchema(NamedTuple):
     instance_config: Optional[bytes]
     dropped_dbs: tuple
 
-    def diff(self, other: ClientSchema) -> ClientSchema:
+    def diff(self, other: ClientSchema) -> tuple[ClientSchema, int, int]:
         # Compare this schema with the other schema, generate a new schema with
         # fields from this schema which are different in the other schema,
         # while the identical fields are left None, so that we can send the
@@ -99,69 +105,38 @@ class ClientSchema(NamedTuple):
         dropped_dbs = tuple(
             dbname for dbname in other.dbs if dbname not in self.dbs
         )
+        added = 0
+        updated = 0
         dbs: immutables.Map[str, PickledState] = immutables.Map()
         for dbname, state in self.dbs.items():
             other_state = other.dbs.get(dbname)
             if other_state is None:
                 dbs = dbs.set(dbname, state)
+                added += 1
             elif state is not other_state:
                 dbs = dbs.set(dbname, state.diff(other_state))
+                updated += 1
         global_schema = instance_config = None
         if self.global_schema is not other.global_schema:
             global_schema = self.global_schema
         if self.instance_config is not other.instance_config:
             instance_config = self.instance_config
-        return ClientSchema(dbs, global_schema, instance_config, dropped_dbs)
+        return (
+            ClientSchema(dbs, global_schema, instance_config, dropped_dbs),
+            added,
+            updated,
+        )
+
+    def get_estimated_size(self) -> int:
+        return sum(db.get_estimated_size() for db in self.dbs.values())
 
 
-class Worker(pool_mod.Worker):
+class Worker(pool_mod.BaseMultiTenantWorker[ClientSchema, "MultiSchemaPool"]):
 
     _last_pickled_state_id: int
-    _cache: collections.OrderedDict[int, ClientSchema]
-    _invalidated_clients: list[int]
-    _last_used_by_client: dict[int, float]
 
-    def __init__(
-        self,
-        manager: MultiSchemaPool,
-        server: amsg.Server,
-        pid: int,
-        backend_runtime_params: pgparams.BackendRuntimeParams,
-        std_schema: s_schema.FlatSchema,
-        refl_schema: s_schema.FlatSchema,
-        schema_class_layout: s_refl.SchemaClassLayout,
-    ) -> None:
-        super().__init__(
-            manager,
-            server,
-            pid,
-            backend_runtime_params,
-            std_schema,
-            refl_schema,
-            schema_class_layout,
-            None,
-            None,
-        )
+    def _init(self) -> None:
         self._last_pickled_state_id = 0
-        self._cache = collections.OrderedDict()
-        self._invalidated_clients = []
-        self._last_used_by_client = {}
-
-    def get_client_schema(self, client_id: int) -> ClientSchema | None:
-        return self._cache.get(client_id)
-
-    def set_client_schema(
-        self, client_id: int, client_schema: ClientSchema
-    ) -> None:
-        self._cache[client_id] = client_schema
-        self._cache.move_to_end(client_id, last=False)
-        self._last_used_by_client[client_id] = time.monotonic()
-
-    def cache_size(self) -> int:
-        return len(self._cache) - len(self._invalidated_clients)
-
-    def last_used(self, client_id: int) -> float:
-        return self._last_used_by_client.get(client_id, 0)
 
     def invalidate(self, client_id: int) -> None:
         if self._cache.pop(client_id, None):
@@ -173,12 +148,6 @@ class Worker(pool_mod.Worker):
             client_id, _ = self._cache.popitem(last=True)
             self._invalidated_clients.append(client_id)
             self._last_used_by_client.pop(client_id, None)
-
-    def flush_invalidation(self) -> list[int]:
-        rv, self._invalidated_clients = self._invalidated_clients, []
-        for client_id in rv:
-            self._cache.pop(client_id, None)
-        return rv
 
     async def call(
         self,
@@ -211,7 +180,7 @@ class MultiSchemaPool(
     _catalog_version: Optional[int]
     _inited: asyncio.Event
     _clients: dict[int, ClientSchema]
-    _client_versions: dict[int, int]
+    _client_names: dict[int, str]
     _secret: bytes
 
     def __init__(self, cache_size, *, secret, **kwargs):
@@ -220,7 +189,7 @@ class MultiSchemaPool(
         self._inited = asyncio.Event()
         self._cache_size = cache_size
         self._clients = {}
-        self._client_versions = {}
+        self._client_names = {}
         self._secret = secret
 
     def _init(self, kwargs: dict[str, Any]) -> None:
@@ -250,37 +219,21 @@ class MultiSchemaPool(
     async def _init_server(
         self,
         client_id: int,
+        client_name: str,
+        compiler_protocol: int,
         catalog_version: int,
         init_args_pickled: pool_mod.RemoteInitArgsPickle,
     ) -> None:
+        if compiler_protocol > pool_mod.CURRENT_COMPILER_PROTOCOL:
+            raise state_mod.IncompatibleClient("compiler_protocol")
+
         (
             std_args_pickled,
             client_args_pickled,
             global_schema_pickle,
             system_config_pickled,
         ) = init_args_pickled
-        client_args = pickle.loads(client_args_pickled)
-        dbs_arg: immutables.Map[str, PickledState]
-        if len(client_args) == 1:
-            # This is a new v2 client
-            backend_runtime_params, = client_args
-            dbs_arg = immutables.Map()
-            client_version = 2
-        else:
-            # be compatible with pre-#8621 clients
-            dbs, backend_runtime_params = client_args
-            dbs_arg = immutables.Map(
-                (
-                    dbname,
-                    PickledState(
-                        state.user_schema_pickle,
-                        pickle.dumps(state.reflection_cache, -1),
-                        pickle.dumps(state.database_config, -1),
-                    ),
-                )
-                for dbname, state in dbs.items()
-            )
-            client_version = 1
+        backend_runtime_params, = pickle.loads(client_args_pickled)
         if self._inited.is_set():
             logger.debug("New client %d connected.", client_id)
             assert self._catalog_version is not None
@@ -303,12 +256,12 @@ class MultiSchemaPool(
                 client_id,
             )
         self._clients[client_id] = ClientSchema(
-            dbs=dbs_arg,
+            dbs=immutables.Map(),
             global_schema=global_schema_pickle,
             instance_config=system_config_pickled,
             dropped_dbs=(),
         )
-        self._client_versions[client_id] = client_version
+        self._client_names[client_id] = client_name
 
     def _sync(
         self,
@@ -379,7 +332,7 @@ class MultiSchemaPool(
             return False
 
     def _weighter(self, client_id: int, worker: Worker) -> queue.Comparable:
-        client_schema = worker.get_client_schema(client_id)
+        client_schema = worker.get_tenant_schema(client_id, touch=False)
         return (
             bool(client_schema),
             worker.last_used(client_id)
@@ -422,21 +375,71 @@ class MultiSchemaPool(
             weighter=functools.partial(self._weighter, client_id)
         )
         try:
+            pid = str(worker.get_pid())
             client_schema = self._clients[client_id]
+            client_name = self._client_names[client_id]
+            worker.set_client_name(client_id, client_name)
             diff: Optional[ClientSchema] = client_schema
-            cache = worker.get_client_schema(client_id)
+            cache = worker.get_tenant_schema(client_id)
             extra_args: tuple[Any, ...] = ()
+            metrics.compiler_process_branch_actions.inc(
+                1, pid, client_name, 'request'
+            )
             if cache is client_schema:
                 # client schema is already in sync, don't send again
                 diff = None
                 msg_arg = bytes(msg)
+                metrics.compiler_process_client_actions.inc(
+                    1, pid, 'cache-hit'
+                )
+                metrics.compiler_process_branch_actions.inc(
+                    1, pid, client_name, 'cache-hit'
+                )
+
             else:
+                metrics.compiler_process_schema_size.set(
+                    client_schema.get_estimated_size(), pid, client_name
+                )
+                metrics.compiler_process_branches.set(
+                    len(client_schema.dbs), pid, client_name
+                )
+
                 if cache is None:
                     # make room for the new client in this worker
                     worker.invalidate_last(self._cache_size)
+                    metrics.compiler_process_branch_actions.inc(
+                        len(client_schema.dbs), pid, client_name, 'cache-add'
+                    )
+                    metrics.compiler_process_client_actions.inc(
+                        1, pid, 'cache-add'
+                    )
+
                 else:
                     # only send the difference in user schema
-                    diff = client_schema.diff(cache)
+                    diff, dbs_added, dbs_updated = client_schema.diff(cache)
+                    if dbname not in diff.dbs:
+                        metrics.compiler_process_branch_actions.inc(
+                            1, pid, client_name, 'cache-hit'
+                        )
+                    if dbs_added:
+                        metrics.compiler_process_branch_actions.inc(
+                            dbs_added, pid, client_name, 'cache-add'
+                        )
+                    if dbs_updated:
+                        metrics.compiler_process_branch_actions.inc(
+                            dbs_updated, pid, client_name, 'cache-update'
+                        )
+                    if diff.dropped_dbs:
+                        metrics.compiler_process_branch_actions.inc(
+                            len(diff.dropped_dbs),
+                            pid,
+                            client_name,
+                            'cache-evict',
+                        )
+                    metrics.compiler_process_client_actions.inc(
+                        1, pid, 'cache-update'
+                    )
+
                 if updated:
                     # re-pickle the request if user schema changed
                     msg_arg = None
@@ -449,13 +452,12 @@ class MultiSchemaPool(
                 client_id,
                 diff,
                 invalidation,
-                self._client_versions[client_id],
                 msg_arg,
                 *extra_args,
             )
             status, *data = pickle.loads(resp)
             if status == 0:
-                worker.set_client_schema(client_id, client_schema)
+                worker.set_tenant_schema(client_id, client_schema)
                 if method_name == "compile":
                     _units, new_pickled_state = data[0]
                     if new_pickled_state:
@@ -465,7 +467,7 @@ class MultiSchemaPool(
             elif status == 1:
                 exc, _tb = data
                 if not isinstance(exc, state_mod.FailedStateSync):
-                    worker.set_client_schema(client_id, client_schema)
+                    worker.set_tenant_schema(client_id, client_schema)
             else:
                 exc = RuntimeError(
                     "could not serialize result in worker subprocess"
@@ -542,7 +544,7 @@ class MultiSchemaPool(
             if method_name != "__init_server__":
                 await self._ready_evt.wait()
             if method_name == "__init_server__":
-                await self._init_server(client_id, *args)
+                await self._init_server(client_id, protocol.client_name, *args)
                 pickled = pickle.dumps((0, None), -1)
             elif method_name in {
                 "compile",
@@ -550,32 +552,16 @@ class MultiSchemaPool(
                 "compile_graphql",
                 "compile_sql",
             }:
-                match self._client_versions.get(client_id):
-                    case 1:
-                        # compatible with pre-#8621 clients
-                        evicted_dbs = []
-                        (
-                            dbname,
-                            user_schema,
-                            reflection_cache,
-                            global_schema,
-                            database_config,
-                            system_config,
-                            *args,
-                        ) = args
-
-                    case _:
-                        (
-                            dbname,
-                            evicted_dbs,
-                            user_schema,
-                            reflection_cache,
-                            global_schema,
-                            database_config,
-                            system_config,
-                            *args,
-                        ) = args
-
+                (
+                    dbname,
+                    evicted_dbs,
+                    user_schema,
+                    reflection_cache,
+                    global_schema,
+                    database_config,
+                    system_config,
+                    *args,
+                ) = args
                 pickled = await self._call_for_client(
                     client_id=client_id,
                     method_name=method_name,
@@ -611,7 +597,7 @@ class MultiSchemaPool(
     def client_disconnected(self, client_id: int) -> None:
         logger.debug("Client %d disconnected, invalidating cache.", client_id)
         self._clients.pop(client_id, None)
-        self._client_versions.pop(client_id, None)
+        self._client_names.pop(client_id, None)
         for worker in self._workers.values():
             worker.invalidate(client_id)
 
@@ -622,6 +608,7 @@ class CompilerServerProtocol(asyncio.Protocol):
     _stream: amsg.MessageStream
     _transport: Optional[asyncio.Transport]
     _client_id: int
+    _client_name: str
 
     def __init__(
         self,
@@ -634,12 +621,18 @@ class CompilerServerProtocol(asyncio.Protocol):
         self._stream = amsg.MessageStream()
         self._transport = None
         self._client_id = _client_id_seq = _client_id_seq + 1
+        self._client_name = 'unknown'
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = cast(asyncio.Transport, transport)
         self._transport.write(
             amsg._uint64_packer(os.getpid()) + amsg._uint64_packer(0)
         )
+        peername = transport.get_extra_info('peername')
+        try:
+            self._client_name = '%s:%d' % peername
+        except Exception:
+            self._client_name = str(peername)
 
     def connection_lost(self, exc: Optional[Exception]) -> None:
         self._transport = None
@@ -657,6 +650,10 @@ class CompilerServerProtocol(asyncio.Protocol):
     def client_id(self) -> int:
         return self._client_id
 
+    @property
+    def client_name(self) -> str:
+        return self._client_name
+
     def reply(self, req_id: int, resp: bytes) -> None:
         if self._transport is None:
             return
@@ -672,11 +669,13 @@ class CompilerServerProtocol(asyncio.Protocol):
 
 
 class MetricsProtocol(asyncio.Protocol):
+    _pool: MultiSchemaPool
     transport: Optional[asyncio.Transport]
     parser: httptools.HttpRequestParser
     url: Optional[bytes]
 
-    def __init__(self):
+    def __init__(self, pool: MultiSchemaPool) -> None:
+        self._pool = pool
         self.transport = None
         self.parser = httptools.HttpRequestParser(self)
         self.url = None
@@ -699,6 +698,7 @@ class MetricsProtocol(asyncio.Protocol):
                 self.respond("200 OK", "OK")
 
             case b"GET", b"/metrics":
+                self._pool.refresh_metrics()
                 self.respond(
                     "200 OK",
                     metrics.registry.generate(),
@@ -740,6 +740,7 @@ async def server_main(
     metrics_port: Optional[int],
     worker_max_rss: Optional[int],
 ):
+    logsetup.setup_logging('i', 'stderr')
     if listen_port is None:
         listen_port = defines.EDGEDB_REMOTE_COMPILER_PORT
     if runstate_dir is None:
@@ -786,7 +787,7 @@ async def server_main(
                             loop,
                             listen_addresses,
                             metrics_port,
-                            MetricsProtocol,
+                            lambda: MetricsProtocol(pool),
                             "metrics",
                         )
                     )
