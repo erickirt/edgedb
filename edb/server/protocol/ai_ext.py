@@ -2160,21 +2160,84 @@ async def _start_ollama_chat(
             base_url.split('/')[:-1] + ['v1']
         )
 
+    # Generate params differently for stream and non-stream modes since they
+    # use different APIs.
+    options = {
+        **({"temperature": temperature} if temperature is not None else {}),
+        **({"top_p": top_p} if top_p is not None else {}),
+        **({"top_k": top_k} if top_k is not None else {}),
+    }
+
+    if stream:
+        params = {
+            "model": model_name,
+            "messages": messages,
+            "options": options,
+        }
+
+        # Only include tools in streaming params if no tool messages are
+        # provided.
+        if tools is not None and not any(
+            message["role"] == "tool"
+            for message in messages
+        ):
+            params["tools"] = tools
+
+    else:
+        converted_messages = []
+        for message in messages:
+            if message["role"] == "user":
+                # Ollama can't handle content block messages.
+                # Unpack them into separate messages.
+                if isinstance(message["content"], str):
+                    converted_messages.append(message)
+                else:
+                    # array of content blocks
+                    for block in message["content"]:
+                        if block["type"] != "text":
+                            raise TypeError(
+                                f"Unsupported content type: '{block["type"]}'. "
+                                f"For non-text content, use streamed mode."
+                            )
+                        converted_messages.append({
+                            "role": message["role"],
+                            "content": block["text"],
+                        })
+
+            elif message["role"] == "assistant":
+                # Gel http API packs arguments into a string, but ollama
+                # requires plain json.
+                converted_messages.append({
+                    "role": message["role"],
+                    "content": message["content"],
+                    "tool_calls": [
+                        {
+                            "id": tool_call["id"],
+                            "function": {
+                                "name": tool_call["function"]["name"],
+                                "arguments": json.loads(
+                                    tool_call["function"]["arguments"]
+                                ),
+                            }
+                        }
+                        for tool_call in message["tool_calls"]
+                    ]
+                })
+
+            else:
+                converted_messages.append(message)
+
+        params = {
+            "model": model_name,
+            "messages": converted_messages,
+            "options": options,
+            **({"tools": tools} if tools is not None else {}),
+        }
+
     client = http_client.with_context(
         headers={},
         base_url=base_url,
     )
-
-    params = {
-        "model": model_name,
-        "messages": messages,
-        "options": {
-            **({"temperature": temperature} if temperature is not None else {}),
-            **({"top_p": top_p} if top_p is not None else {}),
-            **({"top_k": top_k} if top_k is not None else {}),
-        },
-        **({"tools": tools} if tools is not None else {}),
-    }
 
     if stream:
         async with aconnect_sse(
@@ -2189,7 +2252,7 @@ async def _start_ollama_chat(
             # we need tool_index and finish_reason to correctly
             # send 'content_block_stop' chunk for tool call messages
             tool_index = 0
-            finish_reason = "unknown"
+            finish_reason: Optional[str] = "unknown"
 
             started = False
 
@@ -2222,8 +2285,9 @@ async def _start_ollama_chat(
 
                 message = sse.json()
                 if message.get("object") == "chat.completion.chunk":
-                    data = message.get("choices")[0]
-                    delta = data.get("delta")
+                    choices = message.get("choices")
+                    data = choices[0] if choices else {}
+                    delta = data.get("delta") or {}
                     role = delta.get("role")
                     tool_calls = delta.get("tool_calls")
 
@@ -2372,6 +2436,22 @@ async def _start_ollama_chat(
         response.content_type = b'application/json'
 
         result_data = result.json()
+
+        tool_calls = result_data["message"].get("tool_calls")
+        tool_calls_formatted = [
+            {
+                # Ollama does not provide tool call ids for non-stream.
+                # Use enumerate to generate a placeholder.
+                "id": f"call_{tool_call_id}",
+                # Ollama doesn't provide the tool call type but it should
+                # always be 'function'.
+                "type": "function",
+                "name": tool_call["function"]["name"],
+                "args": tool_call["function"]["arguments"],
+            }
+            for tool_call_id, tool_call in enumerate(tool_calls or [])
+        ]
+
         body = {
             "model": result_data["model"],
             "text": result_data["message"]["content"],
@@ -2380,6 +2460,7 @@ async def _start_ollama_chat(
                 "prompt_tokens": result_data["prompt_eval_count"],
                 "completion_tokens": result_data["eval_count"]
             },
+            "tool_calls": tool_calls_formatted,
         }
 
         # Ollama has no documented tools response
@@ -2482,7 +2563,7 @@ async def _handle_rag_request(
         if ctx_globals is not None and not isinstance(ctx_globals, dict):
             raise TypeError('"globals" must be a JSON object')
 
-        model = body.get('model')
+        model = cast(str, body.get('model'))
         if not model:
             raise TypeError(
                 'missing required "model" in request')
@@ -2648,13 +2729,30 @@ async def _handle_rag_request(
     except Exception as ex:
         raise BadRequestError(ex.args[0])
 
-    provider_name = await _get_model_provider(
-        db,
-        base_model_type="ext::ai::TextGenerationModel",
-        model_name=model,
-    )
+    provider_name: str
+    model_name: str
+    try_builtin = False
+    if ':' in model:
+        parts = model.split(':')
+        if len(parts) > 2:
+            raise BadRequestError(
+                f"Invalid model uri, ':' used more than once: {model}"
+            )
+        provider_name = parts[0]
+        model_name = parts[1]
+        try_builtin = True
 
-    chat_provider = _get_provider_config(db, provider_name)
+    else:
+        provider_name = await _get_model_provider(
+            db,
+            base_model_type="ext::ai::TextGenerationModel",
+            model_name=model,
+        )
+        model_name = model
+
+    chat_provider = _get_provider_config(
+        db, provider_name, try_builtin=try_builtin
+    )
 
     vector_provider, vector_query = await _generate_embeddings_for_type(
         db,
@@ -2755,7 +2853,7 @@ async def _handle_rag_request(
         response=response,
         provider=chat_provider,
         http_client=http_client,
-        model_name=model,
+        model_name=model_name,
         messages=messages,
         stream=stream,
         temperature=body.get("temperature"),
@@ -2932,24 +3030,46 @@ async def _db_error(
 def _get_provider_config(
     db: dbview.Database,
     provider_name: str,
+    try_builtin: bool = False,
 ) -> ProviderConfig:
+    """Try to return a provider config with a matching name.
+    Otherwise, raise an error.
+
+    Checks if there is a builtin provider with a matching name.
+
+    eg. "openai" -> ProviderConfig(name="builtin::openai", ...)
+    """
+
     cfg = db.lookup_config("ext::ai::Config::providers")
 
+    def _create_provider_config(db_cfg: Any) -> ProviderConfig:
+        cfg = cast(ProviderConfig, db_cfg)
+        return ProviderConfig(
+            name=cfg.name,
+            display_name=cfg.display_name,
+            api_url=cfg.api_url,
+            client_id=cfg.client_id,
+            secret=cfg.secret,
+            api_style=cfg.api_style,
+        )
+
+    # try builtin prefix
+    builtin_prefix = "builtin::"
+    if try_builtin and not provider_name.startswith(builtin_prefix):
+        builtin_name = builtin_prefix + provider_name
+
+        for provider in cfg:
+            if provider.name == builtin_name:
+                return _create_provider_config(provider)
+
+    # try unmodified name
     for provider in cfg:
         if provider.name == provider_name:
-            provider = cast(ProviderConfig, provider)
-            return ProviderConfig(
-                name=provider.name,
-                display_name=provider.display_name,
-                api_url=provider.api_url,
-                client_id=provider.client_id,
-                secret=provider.secret,
-                api_style=provider.api_style,
-            )
-    else:
-        raise ConfigurationError(
-            f"provider {provider_name!r} has not been configured"
-        )
+            return _create_provider_config(provider)
+
+    raise ConfigurationError(
+        f"provider {provider_name!r} has not been configured"
+    )
 
 
 async def _get_model_annotation_as_json(
