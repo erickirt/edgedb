@@ -1920,6 +1920,27 @@ class TestSQLQuery(tb.SQLQueryTestCase):
             {"Captain Miller", ""}
         )
 
+    async def test_sql_query_copy_06(self):
+        out = io.BytesIO()
+        await self.scon.copy_from_query(
+            """
+            SELECT title, pages FROM public."Book" ORDER BY pages
+            """,
+            output=out,
+            format="csv",
+            delimiter="\t",
+        )
+        out = io.StringIO(out.getvalue().decode("utf-8"))
+        res = list(csv.reader(out, delimiter="\t"))
+
+        self.assertEqual(
+            res,
+            [
+                ['Chronicles of Narnia', '206'],
+                ['Hunger Games', '374'],
+            ]
+        )
+
     async def test_sql_query_error_01(self):
         with self.assertRaisesRegex(
             asyncpg.UndefinedFunctionError,
@@ -3456,6 +3477,20 @@ class TestSQLQueryNonTransactional(tb.SQLQueryTestCase):
         await self.scon.execute("ROLLBACK")
         v2 = await self.scon.fetchval("SHOW transaction_isolation")
         self.assertNotEqual(v1, v2)
+
+    async def test_sql_transaction_03(self):
+        self.assertEqual(
+            await self.scon.execute("BEGIN"),
+            "BEGIN",
+        )
+        await self.scon.execute("ROLLBACK")
+
+    async def test_sql_transaction_04(self):
+        self.assertEqual(
+            await self.scon.execute("START TRANSACTION"),
+            "START TRANSACTION",
+        )
+        await self.scon.execute("ROLLBACK")
 
     async def test_sql_query_error_11(self):
         # extended query protocol

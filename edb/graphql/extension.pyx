@@ -257,6 +257,7 @@ async def compile(
             operation_name,
             variables,
             client_id=tenant.client_id,
+            client_name=tenant.get_instance_name(),
         )
     finally:
         metrics.query_compilation_duration.observe(
@@ -381,6 +382,8 @@ async def _execute(db, tenant, query, operation_name, variables, globals):
         dbname=db.name,
         query_cache=False,
         protocol_version=edbdef.CURRENT_PROTOCOL,
+        # TODO: This should change
+        role_name=edbdef.EDGEDB_SUPERUSER,
     )
 
     async with tenant.with_pgcon(db.name) as pgcon:

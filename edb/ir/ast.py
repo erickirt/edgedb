@@ -476,6 +476,8 @@ class Pointer(Expr):
     anchor: typing.Optional[str] = None
     show_as_anchor: typing.Optional[str] = None
 
+    is_mutation: bool = False
+
     @property
     def is_inbound(self) -> bool:
         return self.direction == s_pointers.PointerDirection.Inbound
@@ -689,6 +691,8 @@ class ParamTransType:
 
 @dataclasses.dataclass(eq=False)
 class ParamScalar(ParamTransType):
+    cast_to: typing.Optional[TypeRef] = None
+
     def flatten(self) -> tuple[typing.Any, ...]:
         return (int(qltypes.TypeTag.SCALAR), self.idx)
 
@@ -723,6 +727,13 @@ class Global(Param):
 
     This is needed when a global has a default but also is optional,
     and so we need to distinguish "unset" and "set to {}".
+    """
+
+    is_permission: bool
+    """Whether this global comes from a Permission.
+
+    Permissions are injected directly by the server based on the connection
+    role.
     """
 
 

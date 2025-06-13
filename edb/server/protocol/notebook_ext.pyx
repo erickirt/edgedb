@@ -157,6 +157,8 @@ async def execute(db, tenant, queries: list):
         dbname=db.name,
         query_cache=False,
         protocol_version=edbdef.CURRENT_PROTOCOL,
+        # TODO: This should change
+        role_name=edbdef.EDGEDB_SUPERUSER,
     )
     compiler_pool = tenant.server.get_compiler_pool()
     units = await compiler_pool.compile_notebook(
@@ -170,6 +172,7 @@ async def execute(db, tenant, queries: list):
         CURRENT_PROTOCOL,
         50,  # implicit limit
         client_id=tenant.client_id,
+        client_name=tenant.get_instance_name(),
     )
     result = []
     bind_data = None

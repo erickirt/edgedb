@@ -491,6 +491,21 @@ class TestEdgeQLGlobals(tb.QueryTestCase):
             ],
         )
 
+    async def test_edgeql_globals_18(self):
+        await self.con.execute('''
+            CREATE GLOBAL foo := ([(f := 1)]);
+        ''')
+        await self.con.execute('''
+            CREATE GLOBAL bar -> array<tuple<f: int64>>;
+        ''')
+        await self.con.execute('''
+            SET GLOBAL bar := ([(f := 1)]);
+        ''')
+        await self.assert_query_result(
+            'SELECT GLOBAL default::bar',
+            [[{'f': 1}]],
+        )
+
     async def test_edgeql_globals_client_01(self):
         con = edgedb.create_async_client(
             **self.get_connect_args(database=self.con.dbname)
@@ -590,12 +605,8 @@ class TestEdgeQLGlobals(tb.QueryTestCase):
     async def test_edgeql_globals_composite(self):
         # Test various composite global variables.
 
-        # HACK: Using with_globals on testbase.Connection doesn't
-        # work, and I timed out on understanding why; I got the state
-        # plumbed into the real client library code, where the state
-        # codec was not encoding it.
-        # It isn't actually important for that to work, so for now
-        # we create a connection with the real honest client library.
+        # with_globals isn't supported in the testbase client, so use
+        # the stock client instead
         con = edgedb.create_async_client(
             **self.get_connect_args(database=self.con.dbname)
         )

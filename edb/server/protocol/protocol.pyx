@@ -750,7 +750,7 @@ cdef class HttpProtocol:
                 path_parts[1:],
                 self.server,
                 self.tenant,
-                self.is_tenant_host,
+                is_tenant_host=self.is_tenant_host,
             )
         elif path_parts == ['metrics'] and request.method == b'GET':
             if not await self._authenticate_for_default_conn_transport(
@@ -760,6 +760,7 @@ cdef class HttpProtocol:
             ):
                 return
 
+            self.server.get_compiler_pool().refresh_metrics()
             # Quoting the Open Metrics spec:
             #    Implementers MUST expose metrics in the OpenMetrics
             #    text format in response to a simple HTTP GET request
