@@ -610,7 +610,8 @@ def _process_view(
 
         if ptr_set:
             src_path_id = path_id
-            if ptrcls.is_link_property(ctx.env.schema):
+            is_linkprop = ptrcls.is_link_property(ctx.env.schema)
+            if is_linkprop:
                 src_path_id = src_path_id.ptr_path()
 
             ptr_set.path_id = pathctx.extend_path_id(
@@ -626,6 +627,15 @@ def _process_view(
                 direction=s_pointers.PointerDirection.Outbound,
                 ptrref=not_none(ptr_set.path_id.rptr()),
                 is_definition=True,
+
+                is_mutation=(
+                    is_mutation
+                    or (
+                        is_linkprop
+                        and s_ctx.view_rptr is not None
+                        and s_ctx.view_rptr.exprtype.is_mutation()
+                    )
+                ),
             )
             # XXX: We would maybe like to *not* do this when it
             # already has a context, since for explain output that
@@ -766,7 +776,13 @@ def _expand_splat(
         if ptr.get_secret(ctx.env.schema):
             continue
         sname = ptr.get_shortname(ctx.env.schema)
-        if sname.name in skip_ptrs:
+        # Skip any dunder properties; these are injected properties like
+        # __tid__ and __tname__, and we want to manage injecting them
+        # ourselves, in the correct positions.
+        if (
+            (sname.name.startswith('__') and sname.name.endswith('__'))
+            or sname.name in skip_ptrs
+        ):
             continue
         step = qlast.Ptr(name=sname.name)
         # Make sure not to overwrite the id property.
@@ -805,7 +821,10 @@ def _expand_splat(
             if not isinstance(ptr, s_links.Link):
                 continue
             pn = ptr.get_shortname(ctx.env.schema)
-            if pn.name == '__type__' or pn.name in skip_ptrs:
+            if (
+                (pn.name.startswith('__') and pn.name.endswith('__'))
+                or pn.name in skip_ptrs
+            ):
                 continue
             elements.append(
                 qlast.ShapeElement(
@@ -1219,11 +1238,6 @@ def _compile_rewrites_for_stype(
                 scopectx.iterator_path_ids |= {anchor.path_id}
                 scopectx.anchors[key] = anchor
 
-            # XXX: I am pretty sure this must be wrong, but we get
-            # a failure without due to volatility issues in
-            # test_edgeql_rewrites_16
-            scopectx.env.singletons.append(anchors.subject_set.path_id)
-
             ctx.path_scope.factoring_allowlist.add(anchors.subject_set.path_id)
 
             # prepare expression
@@ -1298,7 +1312,9 @@ def prepare_rewrite_anchors(
         pointer_path_id = irast.PathId.from_type(
             schema,
             bool_type,
-            typename=sn.QualName(module="__derived__", name=pn.name),
+            typename=sn.QualName(
+                module="__derived__", name=ctx.aliases.get(pn.name)
+            ),
             namespace=ctx.path_id_namespace,
             env=ctx.env,
         )
@@ -1322,7 +1338,7 @@ def prepare_rewrite_anchors(
 
     # init set for __old__
     if r_ctx.kind == qltypes.RewriteKind.Update:
-        old_name = sn.QualName("__derived__", "__old__")
+        old_name = sn.QualName("__derived__", ctx.aliases.get("__old__"))
         old_path_id = irast.PathId.from_type(
             schema, stype, typename=old_name,
             namespace=ctx.path_id_namespace, env=ctx.env,
