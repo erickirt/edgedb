@@ -78,6 +78,7 @@ async def handle_request(
     object request,
     object response,
     object db,
+    str role_name,
     list args,
     object tenant,
 ):
@@ -203,7 +204,7 @@ async def handle_request(
     response.content_type = b'application/json'
     try:
         result = await _execute(
-            db, tenant, query, operation_name, variables, globals)
+            db, role_name, tenant, query, operation_name, variables, globals)
     except Exception as ex:
         if debug.flags.server:
             markup.dump(ex)
@@ -257,6 +258,7 @@ async def compile(
             operation_name,
             variables,
             client_id=tenant.client_id,
+            client_name=tenant.get_instance_name(),
         )
     finally:
         metrics.query_compilation_duration.observe(
@@ -265,7 +267,9 @@ async def compile(
             "graphql",
         )
 
-async def _execute(db, tenant, query, operation_name, variables, globals):
+async def _execute(
+    db, role_name, tenant, query, operation_name, variables, globals
+):
     dbver = db.dbver
     query_cache = tenant.server._http_query_cache
 
@@ -381,6 +385,7 @@ async def _execute(db, tenant, query, operation_name, variables, globals):
         dbname=db.name,
         query_cache=False,
         protocol_version=edbdef.CURRENT_PROTOCOL,
+        role_name=role_name,
     )
 
     async with tenant.with_pgcon(db.name) as pgcon:

@@ -128,10 +128,8 @@ class Property(
         # because we create new properties with distinct types.
         return not self.is_endpoint_pointer(schema)
 
-    def is_property(self, schema: s_schema.Schema) -> bool:
-        return True
-
-    def scalar(self) -> bool:
+    @classmethod
+    def is_property(cls, schema: Optional[s_schema.Schema]=None) -> bool:
         return True
 
     def has_user_defined_properties(self, schema: s_schema.Schema) -> bool:
@@ -240,12 +238,7 @@ class PropertyCommand(
             scls.is_link_property(schema)
             and not scls.is_pure_computable(schema)
         ):
-            # link properties cannot be required or multi
-            if self.get_attribute_value('required'):
-                raise errors.InvalidPropertyDefinitionError(
-                    'link properties cannot be required',
-                    span=self.span,
-                )
+            # link properties cannot be multi
             if (self.get_attribute_value('cardinality')
                     is qltypes.SchemaCardinality.Many):
                 raise errors.InvalidPropertyDefinitionError(

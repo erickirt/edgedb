@@ -404,6 +404,8 @@ def sdl_to_ddl(
                     ctx.objects[fq_name] = qltracer.Annotation(fq_name)
                 elif isinstance(decl_ast, qlast.CreateGlobal):
                     ctx.objects[fq_name] = qltracer.Global(fq_name)
+                elif isinstance(decl_ast, qlast.CreatePermission):
+                    ctx.objects[fq_name] = qltracer.Permission(fq_name)
                 elif isinstance(decl_ast, qlast.CreateIndex):
                     ctx.objects[fq_name] = qltracer.Index(fq_name)
                 else:
@@ -596,6 +598,15 @@ def trace_layout_CreateProperty(
     _trace_item_layout(node, ctx=ctx)
 
 
+@trace_layout.register
+def trace_layout_CreateConstraint(
+    node: qlast.CreateConstraint,
+    *,
+    ctx: LayoutTraceContext,
+) -> None:
+    _trace_item_layout(node, ctx=ctx)
+
+
 def _trace_item_layout(
     node: qlast.CreateObject,
     *,
@@ -612,7 +623,7 @@ def _trace_item_layout(
     assert fq_name is not None
     PointerType: type[qltracer.Pointer]
 
-    if isinstance(node, qlast.BasedOnTuple):
+    if isinstance(node, qlast.BasedOn):
         bases = []
         # construct the parents set, used later in ancestors graph
         parents = set()
@@ -638,7 +649,7 @@ def _trace_item_layout(
                     for pn, p in base_pointers.items(ctx.schema):
                         PointerType = (
                             qltracer.Property
-                            if p.is_property(ctx.schema) else
+                            if p.is_property() else
                             qltracer.Link
                         )
                         base_obj.pointers[pn] = PointerType(
@@ -1038,6 +1049,21 @@ def trace_Global(
 
 
 @trace_dependencies.register
+def trace_Permission(
+    node: qlast.CreatePermission,
+    *,
+    ctx: DepTraceContext,
+) -> None:
+    deps: list[Dependency] = [
+        TypeDependency(texpr=qlast.TypeName(
+            maintype=qlast.ObjectRef(module='__std__', name='bool')
+        ))
+    ]
+
+    _register_item(node, hard_dep_exprs=deps, ctx=ctx)
+
+
+@trace_dependencies.register
 def trace_Function(
     node: qlast.CreateFunction,
     *,
@@ -1220,6 +1246,11 @@ def _register_item(
                 assert isinstance(alter_cmd, qlast.ConcreteConstraintOp)
                 alter_cmd.subjectexpr = decl.subjectexpr
                 alter_cmd.args = decl.args
+
+            # functions need to preserve arguments
+            if isinstance(decl, qlast.CreateFunction):
+                assert isinstance(alter_cmd, qlast.FunctionCommand)
+                alter_cmd.params = decl.params
 
             if not ctx.depstack:
                 alter_cmd.aliases = [
@@ -1426,7 +1457,7 @@ def _get_bases(
     decl: qlast.CreateObject, *, ctx: LayoutTraceContext
 ) -> list[s_name.QualName]:
     """Resolve object bases from the "extends" declaration."""
-    if not isinstance(decl, qlast.BasedOnTuple):
+    if not isinstance(decl, qlast.BasedOn):
         return []
 
     bases = []
@@ -1593,6 +1624,8 @@ def _get_tracer_type(
     elif isinstance(decl, (qlast.CreateLink,
                            qlast.CreateConcreteLink)):
         tracer_type = qltracer.Link
+    elif isinstance(decl, qlast.CreatePermission):
+        tracer_type = qltracer.Permission
     elif isinstance(decl, (qlast.CreateIndex,
                            qlast.CreateConcreteIndex)):
         tracer_type = qltracer.Index

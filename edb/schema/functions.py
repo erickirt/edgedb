@@ -55,6 +55,7 @@ from . import expr as s_expr
 from . import globals as s_globals
 from . import name as sn
 from . import objects as so
+from . import permissions as s_permissions
 from . import referencing
 from . import types as s_types
 from . import utils
@@ -1012,7 +1013,7 @@ class ParametrizedCommand(sd.ObjectCommand[so.Object_T]):
             # Some Callables, like the concrete constraints,
             # have no params in their AST.
             return []
-        assert isinstance(astnode, qlast.CallableObjectCommandTuple)
+        assert isinstance(astnode, qlast.CallableObjectCommand)
         return cls._get_param_desc_from_params_ast(
             schema, modaliases, astnode.params, param_offset=param_offset)
 
@@ -1214,7 +1215,7 @@ class CreateCallableObject(
     ) -> None:
         super()._apply_fields_ast(schema, context, node)
         params = self._get_params_ast(schema, context, node)
-        if isinstance(node, qlast.CallableObjectCommandTuple):
+        if isinstance(node, qlast.CallableObjectCommand):
             node.params = [p[1] for p in params]
 
 
@@ -1254,8 +1255,26 @@ class Function(
 
     used_globals = so.SchemaField(
         so.ObjectSet[s_globals.Global],
-        coerce=True, default=so.DEFAULT_CONSTRUCTOR,
-        inheritable=False)
+        coerce=True,
+        default=so.DEFAULT_CONSTRUCTOR,
+        inheritable=False
+    )
+
+    used_permissions = so.SchemaField(
+        so.ObjectSet[s_permissions.Permission],
+        coerce=True,
+        default=so.DEFAULT_CONSTRUCTOR,
+        inheritable=False,
+    )
+
+    required_permissions = so.SchemaField(
+        so.ObjectSet[s_permissions.Permission],
+        coerce=True,
+        default=so.DEFAULT_CONSTRUCTOR,
+        inheritable=False,
+        allow_ddl_set=True,
+        compcoef=0.8,
+    )
 
     # A backend_name that is shared between all overloads of the same
     # function, to make them independent from the actual name.
@@ -1713,9 +1732,19 @@ class FunctionCommand(
                     span=body.parse().span,
                 )
 
-        globs = {schema.get(glob.global_name, type=s_globals.Global)
-                 for glob in ir.globals}
+        globs = {
+            schema.get(glob.global_name, type=s_globals.Global)
+            for glob in ir.globals
+            if not glob.is_permission
+        }
         self.set_attribute_value('used_globals', globs)
+
+        permissions = {
+            schema.get(glob.global_name, type=s_permissions.Permission)
+            for glob in ir.globals
+            if glob.is_permission
+        }
+        self.set_attribute_value('used_permissions', permissions)
 
         return expr
 
@@ -2349,7 +2378,7 @@ class DeleteFunction(DeleteCallableObject[Function], FunctionCommand):
 
         params.sort(key=lambda e: e[0])
 
-        assert isinstance(node, qlast.CallableObjectCommandTuple)
+        assert isinstance(node, qlast.CallableObjectCommand)
         node.params = [p[1] for p in params]
 
 
@@ -2363,7 +2392,7 @@ def get_params_symtable(
     anchors: dict[str, qlast.Expr] = {}
 
     defaults_mask = qlast.TypeCast(
-        expr=qlast.Parameter(name='__defaults_mask__'),
+        expr=qlast.Parameter(name='__defaults_mask__', is_func_param=True),
         type=qlast.TypeName(
             maintype=qlast.ObjectRef(
                 module='std',
@@ -2378,7 +2407,7 @@ def get_params_symtable(
             p.get_typemod(schema) is not ft.TypeModifier.SingletonType
         )
         anchors[p_shortname] = qlast.TypeCast(
-            expr=qlast.Parameter(name=p_shortname),
+            expr=qlast.Parameter(name=p_shortname, is_func_param=True),
             cardinality_mod=(
                 qlast.CardinalityModifier.Optional if p_is_optional else None
             ),
@@ -2647,6 +2676,11 @@ def get_compiler_options(
             inlining_context.env.options.func_params
             if inlining_context is not None else
             params
+        ),
+        json_parameters=(
+            inlining_context.env.options.json_parameters
+            if inlining_context is not None else
+            False
         ),
         apply_query_rewrites=not context.stdmode,
         track_schema_ref_exprs=track_schema_ref_exprs,

@@ -24,6 +24,7 @@ from typing import (
     AbstractSet,
     Iterable,
     Mapping,
+    MutableMapping,
     Sequence,
     NamedTuple,
     cast,
@@ -1754,6 +1755,8 @@ def _compile_ql_administer(
         return ddl.administer_vacuum(ctx, ql)
     elif ql.expr.func == 'prepare_upgrade':
         return ddl.administer_prepare_upgrade(ctx, ql)
+    elif ql.expr.func == '_remove_pointless_triggers':
+        return ddl.administer_remove_pointless_triggers(ctx, ql)
     else:
         raise errors.QueryError(
             'Unknown ADMINISTER function',
@@ -1851,6 +1854,7 @@ def _compile_ql_query(
         ir,
         expected_cardinality_one=ctx.expected_cardinality_one,
         output_format=_convert_format(ctx.output_format),
+        json_parameters=options.json_parameters,
         backend_runtime_params=ctx.backend_runtime_params,
         is_explain=options.is_explain,
         cache_as_function=(use_persistent_cache
@@ -1896,10 +1900,31 @@ def _compile_ql_query(
         sql_info_prefix = ''
 
     globals = None
+    permissions = None
+    json_permissions = None
     if ir.globals:
         globals = [
             (str(glob.global_name), glob.has_present_arg)
             for glob in ir.globals
+            if not glob.is_permission
+        ]
+        permissions = [
+            str(glob.global_name)
+            for glob in ir.globals
+            if glob.is_permission
+        ]
+    if options.json_parameters:
+        # In JSON parameters mode, keep only the synthetic globals,
+        # and report the permissions as needing to be injected into
+        # the JSON.
+        if globals:
+            globals = [g for g in globals if g[0].startswith('__::')]
+        json_permissions, permissions = permissions, []
+
+    required_permissions = None
+    if ir.required_permissions:
+        required_permissions = [
+            str(perm.get_name(schema)) for perm in ir.required_permissions
         ]
 
     out_type_id: uuid.UUID
@@ -1985,6 +2010,9 @@ def _compile_ql_query(
         cache_func_call=cache_func_call,
         cardinality=result_cardinality,
         globals=globals,
+        permissions=permissions,
+        required_permissions=required_permissions,
+        json_permissions=json_permissions,
         in_type_id=in_type_id.bytes,
         in_type_data=in_type_data,
         in_type_args=in_type_args,
@@ -2441,6 +2469,7 @@ def _compile_ql_config_op(
         globals = [
             (str(glob.global_name), glob.has_present_arg)
             for glob in ir.globals
+            if not glob.is_permission
         ]
 
     if isinstance(ir, irast.Statement):
@@ -2550,10 +2579,12 @@ def _compile_dispatch_ql(
             return query, enums.Capability(0)
 
     elif isinstance(ql, qlast.DDLCommand):
-        return (
-            ddl.compile_and_apply_ddl_stmt(ctx, ql, source=source),
-            enums.Capability.DDL,
-        )
+        query = ddl.compile_and_apply_ddl_stmt(ctx, ql, source=source)
+        capability = enums.Capability.DDL
+        if isinstance(ql, qlast.GlobalObjectCommand):
+            capability |= enums.Capability.GLOBAL_DDL
+
+        return (query, capability)
 
     elif isinstance(ql, qlast.Transaction):
         return (
@@ -2561,7 +2592,7 @@ def _compile_dispatch_ql(
             enums.Capability.TRANSACTION,
         )
 
-    elif isinstance(ql, qlast.SessionCommand_tuple):
+    elif isinstance(ql, qlast.SessionCommand):
         return (
             _compile_ql_sess_state(ctx, ql),
             enums.Capability.SESSION_CONFIG,
@@ -2580,8 +2611,16 @@ def _compile_dispatch_ql(
                 capability = enums.Capability(0)
             else:
                 capability = enums.Capability.SESSION_CONFIG
+        elif ql.scope is qltypes.ConfigScope.DATABASE:
+            capability = (
+                enums.Capability.PERSISTENT_CONFIG
+                | enums.Capability.BRANCH_CONFIG
+            )
         else:
-            capability = enums.Capability.PERSISTENT_CONFIG
+            capability = (
+                enums.Capability.PERSISTENT_CONFIG
+                | enums.Capability.INSTANCE_CONFIG
+            )
         return (
             _compile_ql_config_op(ctx, ql),
             capability,
@@ -2589,7 +2628,7 @@ def _compile_dispatch_ql(
 
     elif isinstance(ql, qlast.ExplainStmt):
         query = _compile_ql_explain(ctx, ql, script_info=script_info)
-        caps = enums.Capability(0)
+        caps = enums.Capability.ANALYZE
         if (
             isinstance(query, (dbstate.Query, dbstate.SimpleQuery))
             and query.has_dml
@@ -2599,7 +2638,7 @@ def _compile_dispatch_ql(
 
     elif isinstance(ql, qlast.AdministerStmt):
         query = _compile_ql_administer(ctx, ql, script_info=script_info)
-        caps = enums.Capability(0)
+        caps = enums.Capability.ADMINISTER
         return (query, caps)
 
     else:
@@ -2607,6 +2646,8 @@ def _compile_dispatch_ql(
         query = _compile_ql_query(
             ctx, ql, source=source, script_info=script_info)
         caps = enums.Capability(0)
+        if isinstance(ql, qlast.DescribeStmt):
+            caps |= enums.Capability.DESCRIBE
         if (
             isinstance(query, (dbstate.Query, dbstate.SimpleQuery))
             and query.has_dml
@@ -2728,6 +2769,17 @@ def compile_sql_as_unit_group(
                 f"{sql_unit.command_complete_tag}"
             )
 
+        globals = []
+        permissions = []
+        for sp in sql_unit.params or ():
+            if not isinstance(sp, dbstate.SQLParamGlobal):
+                continue
+
+            if not sp.is_permission:
+                globals.append((str(sp.global_name), False))
+            else:
+                permissions.append(str(sp.global_name))
+
         unit = dbstate.QueryUnit(
             sql=value_sql,
             introspection_sql=intro_sql,
@@ -2738,10 +2790,8 @@ def compile_sql_as_unit_group(
                 else sql_unit.cardinality
             ),
             capabilities=sql_unit.capabilities,
-            globals=[
-                (str(sp.global_name), False) for sp in sql_unit.params
-                if isinstance(sp, dbstate.SQLParamGlobal)
-            ] if sql_unit.params else [],
+            globals=globals,
+            permissions=permissions,
             output_format=(
                 enums.OutputFormat.NONE
                 if (
@@ -3006,6 +3056,9 @@ def _make_query_unit(
         unit.cache_sql = comp.cache_sql
         unit.cache_func_call = comp.cache_func_call
         unit.globals = comp.globals
+        unit.permissions = comp.permissions
+        unit.json_permissions = comp.json_permissions
+        unit.required_permissions = comp.required_permissions
         unit.in_type_args = comp.in_type_args
 
         unit.sql_hash = comp.sql_hash
@@ -3279,7 +3332,6 @@ def _extract_params(
         )
 
         if param.sub_params:
-            assert not ctx.json_parameters
             array_tids: list[Optional[uuid.UUID]] = []
             for p in param.sub_params.params:
                 if isinstance(p.schema_type, s_types.Array):
@@ -3680,15 +3732,42 @@ def _extract_extensions(
 def _extract_roles(
     global_schema: s_schema.Schema,
 ) -> immutables.Map[str, immutables.Map[str, Any]]:
-    roles = {}
-    for role in global_schema.get_objects(type=s_role.Role):
+    extracted_roles = {}
+    schema_roles = global_schema.get_objects(type=s_role.Role)
+    for role in schema_roles:
         role_name = str(role.get_name(global_schema))
-        roles[role_name] = immutables.Map(
+        extracted_roles[role_name] = dict(
             name=role_name,
             superuser=role.get_superuser(global_schema),
             password=role.get_password(global_schema),
+            branches=list(sorted(role.get_branches(global_schema))),
         )
-    return immutables.Map(roles)
+
+    # To populate all_permissions, combine the permissions of each role
+    # and its ancestors.
+    role_memberships: MutableMapping[s_role.Role, list[s_role.Role]] = {}
+    role_permissions: MutableMapping[s_role.Role, Sequence[str]] = {}
+    for role in schema_roles:
+        role_memberships[role] = list(
+            role.get_ancestors(global_schema).objects(global_schema)
+        )
+        role_permissions[role] = list(sorted(
+            role.get_permissions(global_schema) or ()
+        ))
+
+    for role in schema_roles:
+        role_name = str(role.get_name(global_schema))
+        extracted_roles[role_name]['all_permissions'] = tuple(set(
+            p
+            for m in [role] + role_memberships.get(role, [])
+            for p in role_permissions[m]
+        ))
+
+    # Convert everything into immutable maps
+    return immutables.Map({
+        name: immutables.Map(role)
+        for name, role in extracted_roles.items()
+    })
 
 
 class DumpDescriptor(NamedTuple):

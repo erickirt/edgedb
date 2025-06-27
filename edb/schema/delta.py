@@ -46,6 +46,7 @@ import uuid
 from edb import errors
 
 from edb.common import adapter
+from edb.common import ast
 from edb.common import checked
 from edb.common import markup
 from edb.common import ordered
@@ -4141,13 +4142,21 @@ class AlterObjectProperty(Command):
                 f'cannot alter object id',
                 span=astnode.span)
 
+        ast_value: Optional[qlast.Expr | qlast.TypeExpr] = astnode.value
+        if field.obj_names_as_string:
+            inliner = NameToStringConverter()
+            ast_value = cast(
+                Optional[qlast.Expr | qlast.TypeExpr],
+                inliner.visit(ast_value),
+            )
+
         new_value: Any
 
         if field.type is s_expr.Expression:
-            if astnode.value is None:
+            if ast_value is None:
                 new_value = None
             else:
-                assert isinstance(astnode.value, qlast.Expr)
+                assert isinstance(ast_value, qlast.Expr)
                 orig_text = cls.get_orig_expr_text(
                     schema, parent_op.qlast, field.name)
 
@@ -4161,13 +4170,13 @@ class AlterObjectProperty(Command):
                     # normalization strategy, so we must renormalize the
                     # expression.
                     expr_ql = qlcompiler.renormalize_compat(
-                        astnode.value,
+                        ast_value,
                         orig_text,
                         schema=schema,
                         localnames=context.localnames,
                     )
                 else:
-                    expr_ql = astnode.value
+                    expr_ql = ast_value
 
                 new_value = s_expr.Expression.from_ast(
                     expr_ql,
@@ -4176,30 +4185,62 @@ class AlterObjectProperty(Command):
                     context.localnames,
                 )
         else:
-            if isinstance(astnode.value, qlast.Tuple):
-                new_value = tuple(
-                    qlcompiler.evaluate_ast_to_python_val(
-                        el, schema=schema)
-                    for el in astnode.value.elements
-                )
-
-            elif isinstance(astnode.value, qlast.ObjectRef):
-
-                new_value = utils.ast_to_object_shell(
-                    astnode.value,
-                    metaclass=so.Object,
-                    modaliases=context.modaliases,
-                    schema=schema,
-                )
-
-            elif (
-                isinstance(astnode.value, qlast.Set)
-                and not astnode.value.elements
+            if (
+                isinstance(ast_value, qlast.Set)
+                and not ast_value.elements
             ):
                 # empty set
                 new_value = None
 
-            elif isinstance(astnode.value, qlast.TypeExpr):
+            elif isinstance(ast_value, qlast.Tuple):
+                new_value = tuple(
+                    qlcompiler.evaluate_ast_to_python_val(
+                        el, schema=schema)
+                    for el in ast_value.elements
+                )
+
+            # Handle object references
+            elif (
+                isinstance(ast_value, qlast.Path)
+                and not ast_value.partial
+                and len(ast_value.steps) == 1
+                and isinstance(ast_value.steps[0], qlast.ObjectRef)
+            ):
+
+                new_value = utils.ast_to_object_shell(
+                    ast_value.steps[0],
+                    metaclass=so.Object,
+                    modaliases=context.modaliases,
+                    schema=schema,
+                )
+                if issubclass(field.type, so.ObjectCollection):
+                    new_value = [new_value]
+
+            # ... and sets of object references
+            # It is kind of a bummer the way this is special cased, though
+            elif (
+                isinstance(ast_value, qlast.Set)
+                and all(
+                    isinstance(v, qlast.Path)
+                    and not v.partial
+                    and len(v.steps) == 1
+                    and isinstance(v.steps[0], qlast.ObjectRef)
+                    for v in ast_value.elements
+                )
+            ):
+                new_value = [
+                    utils.ast_to_object_shell(
+                        v.steps[0],
+                        metaclass=so.Object,
+                        modaliases=context.modaliases,
+                        schema=schema,
+                    )
+                    for v in ast_value.elements
+                    if isinstance(v, qlast.Path)
+                    and isinstance(v.steps[0], qlast.ObjectRef)
+                ]
+
+            elif isinstance(ast_value, qlast.TypeExpr):
                 from . import types as s_types
 
                 if not isinstance(parent_op, QualifiedObjectCommand):
@@ -4209,21 +4250,48 @@ class AlterObjectProperty(Command):
                     )
 
                 new_value = utils.ast_to_type_shell(
-                    astnode.value,
+                    ast_value,
                     metaclass=s_types.Type,
                     module=parent_op.classname.module,
                     modaliases=context.modaliases,
                     schema=schema,
                 )
+                if issubclass(field.type, so.ObjectCollection):
+                    new_value = [new_value]
+
+            # ... and sets of object references
+            # It is kind of a bummer the way this is special cased, though
+            elif (
+                isinstance(ast_value, qlast.Set)
+                and all(
+                    isinstance(v, qlast.TypeExpr)
+                    for v in ast_value.elements
+                )
+            ):
+                from . import types as s_types
+
+                new_value = [
+                    utils.ast_to_type_shell(
+                        v,
+                        metaclass=s_types.Type,
+                        modaliases=context.modaliases,
+                        schema=schema,
+                    )
+                    for v in ast_value.elements
+                    if isinstance(v, qlast.TypeExpr)
+                ]
 
             elif (
-                isinstance(astnode.value, qlast.StrInterp)
+                isinstance(ast_value, qlast.StrInterp)
                 and field.allow_interpolation
             ):
-                new_value = utils.str_interpolation_to_old_style(astnode.value)
+                new_value = utils.str_interpolation_to_old_style(ast_value)
             else:
-                new_value = qlcompiler.evaluate_ast_to_python_val(
-                    astnode.value, schema=schema) if astnode.value else None
+                try:
+                    new_value = qlcompiler.evaluate_ast_to_python_val(
+                        ast_value, schema=schema) if ast_value else None
+                except Exception:
+                    raise
                 if new_value is not None:
                     new_value = field.coerce_value(schema, new_value)
 
@@ -4250,13 +4318,19 @@ class AlterObjectProperty(Command):
     ) -> Optional[qlast.DDLOperation]:
         value = self.new_value
 
-        new_value_empty = \
-            (value is None or
-                (isinstance(value, collections.abc.Container) and not value))
-        old_value_empty = \
-            (self.old_value is None or
-                (isinstance(self.old_value, collections.abc.Container)
-                 and not self.old_value))
+        new_value_empty = (
+            value is None
+            or (
+                utils.is_nontrivial_container(value) is not None and not value
+            )
+        )
+        old_value_empty = (
+            self.old_value is None
+            or (
+                utils.is_nontrivial_container(self.old_value) is not None
+                and not self.old_value
+            )
+        )
 
         parent_ctx = context.current()
         parent_op = parent_ctx.op
@@ -4369,6 +4443,13 @@ class AlterObjectProperty(Command):
                 parent_node=parent_node,
                 parent_node_attr=parent_node_attr,
             )
+        elif issubclass(field.type, so.ObjectCollection):
+            value = qlast.Set(elements=[
+                # HACK: This is wrong, but it's good enough.
+                cast(qlast.Expr, utils.shell_to_ast(schema, v))
+                for v in (value or ())
+            ])
+
         elif parent_node_attr is not None:
             setattr(parent_node, parent_node_attr, value)
             return None
@@ -4451,6 +4532,28 @@ class AlterObjectProperty(Command):
             return f'alter the {self.property} of {object_desc}'
         else:
             return f'alter the {self.property} of schema object'
+
+
+class NameToStringConverter(ast.NodeTransformer):
+
+    def visit_Path(self, node: qlast.Path) -> qlast.Base:
+        if (
+            len(node.steps) == 1
+            and (obj_name := node.steps[0])
+            and isinstance(obj_name, qlast.ObjectRef)
+        ):
+            if obj_name.module is None:
+                raise errors.SchemaDefinitionError(
+                    f"Object name must be fully qualified.",
+                    span=node.span,
+                )
+
+            return qlast.Constant.string(f"{obj_name.module}::{obj_name.name}")
+
+        raise errors.SchemaDefinitionError(
+            f"Object references are not allowed here.",
+            span=node.span,
+        )
 
 
 def compile_ddl(

@@ -259,6 +259,12 @@ class RewriteKind(s_enum.StrEnum):
     Insert = 'Insert'
 
 
+class SplatStrategy(s_enum.StrEnum):
+    Default = 'Default'
+    Explicit = 'Explicit'
+    Implicit = 'Implicit'
+
+
 class DescribeLanguage(s_enum.StrEnum):
     DDL = 'DDL'
     SDL = 'SDL'
@@ -290,6 +296,7 @@ class SchemaObjectClass(s_enum.StrEnum):
     MULTIRANGE_TYPE = 'MULTIRANGE_TYPE'
     OPERATOR = 'OPERATOR'
     PARAMETER = 'PARAMETER'
+    PERMISSION = 'PERMISSION'
     PROPERTY = 'PROPERTY'
     PSEUDO_TYPE = 'PSEUDO TYPE'
     RANGE_TYPE = 'RANGE TYPE'
